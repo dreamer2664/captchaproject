@@ -1471,7 +1471,8 @@ if __name__ == "__main__":
                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
     if len(sys.argv) > 1 and sys.argv[1] == "train12":
         train_v12(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
-                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  last_path="glyphnet12_last.pt")
     if len(sys.argv) > 1 and sys.argv[1] == "train11":
         train_v11(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
                   int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
