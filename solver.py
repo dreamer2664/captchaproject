@@ -423,9 +423,11 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
     # ENSEMBLE: a second weights file (glyphnet8.pt) votes per glyph; the
     # higher-confidence read wins disagreements (independent inits/errors)
     m2 = None
+    _main = glyphnet.get_model()
     for _cand in ("glyphnet10.pt", "glyphnet9.pt", "glyphnet8.pt"):
         _m = glyphnet.get_model(_cand, quiet=True)
-        if _m is not None and _m is not glyphnet.get_model():
+        if (_m is not None and _m is not _main and getattr(
+                _m, "src_path", "") != getattr(_main, "src_path", "")):
             m2 = _m
             break
     if m2 is not None and res and res[0][0]:

@@ -179,6 +179,7 @@ def get_model(path: str = "glyphnet.pt", quiet: bool = False):
                      wide=wide)
         m.load_state_dict(sd)
         m.ch1_whole = ch1w
+        m.src_path = os.path.abspath(path)
         m.eval()
         if path == "glyphnet.pt":
             _model = m
