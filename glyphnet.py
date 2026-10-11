@@ -1196,8 +1196,8 @@ def train_v12(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128
                     if len(xs_l) >= batch:
                         break
                     ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
-                    if abs(ex - xc) > 6:      # merged/split: skip label noise
-                        continue
+                    if abs(ex - xc) > 6 or eh is None:
+                        continue               # merged/split: skip label noise
                     xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
                                       eb + rng.uniform(-2, 2), True,
                                       size_h=eh))
@@ -1252,6 +1252,8 @@ def train_v12(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128
             dom, comps = solver.analyze(solver.norm_scale(img))
             for ch, (xc, base, _sz) in zip(truth, boxes):
                 ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                if eh is None:
+                    continue
                 Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
                                 eb + jr.uniform(-2, 2), True, size_h=eh))
                 Yv.append(ch)
@@ -1289,7 +1291,7 @@ def _fresh_batch_sized(batch: int, seed: int):
             if len(xs) >= batch:
                 break
             ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
-            if abs(ex - xc) > 6:
+            if abs(ex - xc) > 6 or eh is None:
                 continue
             xs.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
                             eb + rng.uniform(-2, 2), True, size_h=eh))
