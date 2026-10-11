@@ -1396,6 +1396,137 @@ def train_v13(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128
 
 
 
+def train_v14(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
+              path: str = "glyphnet14.pt", init: str = "glyphnet13.pt",
+              lr: float = 2e-4, last_path: str = "") -> None:
+    """v14 = v13 recipe, BALANCED mix (hard 50 / real 35 / easy 15): v13
+    bought +2 hard but cost ~5 real; this walks the mix back to the middle.: 50% hard / 30% real / 20% easy cards,
+    case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
+    Suite v10: easy 90 hard 42 real 49; held-out hard per-char 88% vs suite
+    81% -> the remaining hard loss is selection/seg + case under clutter."""
+    import os
+    import solver
+    model = GlyphNet(multitask=True, wide=True, size_ch=True)
+    for cand in (init, "glyphnet8.pt", "glyphnet7.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            sd.pop("ch1_whole", None)
+            own = model.state_dict()
+            k0 = "trunk.0.weight"
+            if (k0 in sd and k0 in own and sd[k0].shape[1] == 2
+                    and own[k0].shape[1] == 3):
+                w = torch.zeros(own[k0].shape)
+                w[:, :2] = sd[k0]
+                sd[k0] = w
+                print("conv1 padded 2ch -> 3ch (size channel zero-init)",
+                      flush=True)
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), lr)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 111002
+    rng = np.random.default_rng(11)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            random.seed(seed)
+            xs_l, yid, ycase = [], [], []
+            while len(xs_l) < batch:
+                style = ("hard", "real", "hard", "real", "hard",
+                         "real", "hard", "easy", "hard", "real")[len(xs_l) % 10]
+                img, truth, boxes = generate(style=style, boxes=True)
+                dom, comps = solver.analyze(solver.norm_scale(img))
+                for ch, (xc, base, _sz) in zip(truth, boxes):
+                    if len(xs_l) >= batch:
+                        break
+                    ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                    if abs(ex - xc) > 6 or eh is None:
+                        continue               # merged/split: skip label noise
+                    xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                                      eb + rng.uniform(-2, 2), True,
+                                      size_h=eh))
+                    yid.append(id36_of(ch))
+                    ycase.append(case_of(ch))
+            xn = np.stack(xs_l)
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np_sized(xn[k], rng)
+                if rng.random() < 0.8:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.5:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice((0.8, 1.25))
+                if rng.random() < 0.3:      # AA/clutter bleed: 1px morph
+                    k3 = np.ones((3, 3), np.uint8)
+                    op = cv2.erode if rng.random() < 0.5 else cv2.dilate
+                    xn[k, 1] = op(xn[k, 1], k3, iterations=1)
+            x = torch.from_numpy(xn)
+            x[:, :2] += 0.02 * torch.rand(len(xn), 2, P, WID) - 0.01
+            yt = torch.tensor(yid, dtype=torch.long)
+            yc = torch.tensor(ycase, dtype=torch.long)
+            li, lc = model(x)
+            loss = crit(li, yt) + 4.0 * crit(lc, yc)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yt)
+            seen += len(yt)
+        sched.step()
+        acc = _quick_acc_sized(model, 3000, seed=999)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            sd["size_ch"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+        if last_path:
+            sdl = dict(model.state_dict())
+            sdl["ch1_whole"] = torch.tensor(1)
+            sdl["size_ch"] = torch.tensor(1)
+            torch.save(sdl, last_path)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom, comps = solver.analyze(solver.norm_scale(img))
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                if eh is None:
+                    continue
+                Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
+                                eb + jr.uniform(-2, 2), True, size_h=eh))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+
+
+
+
 def _aug_patch_np_sized(p: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """_aug_patch_np on the two image channels; the size plane is a constant
     and must survive geometric/photometric aug untouched."""
@@ -1599,6 +1730,10 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "train5":
         train_v5(int(sys.argv[2]) if len(sys.argv) > 2 else 12,
                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train14":
+        train_v14(int(sys.argv[2]) if len(sys.argv) > 2 else 30,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  last_path="glyphnet14_last.pt")
     if len(sys.argv) > 1 and sys.argv[1] == "train13":
         train_v13(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
                   int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
