@@ -417,10 +417,12 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
     for c in kept:
         ys, xs = np.where(c["m"])
         xcs.append(c["x"] + float(xs.mean()))
-    res = (glyphnet.classify_many_tta(dom, xcs, baseline, top2=True)
+    sizes = [float(c["h"]) for c in kept]
+    res = (glyphnet.classify_many_tta(dom, xcs, baseline, top2=True,
+                                      sizes=sizes)
            if getattr(glyphnet.get_model(), "tta", True)
            else [(ch, cf, ch) for ch, cf in
-                 glyphnet.classify_many(dom, xcs, baseline)])
+                 glyphnet.classify_many(dom, xcs, baseline, sizes=sizes)])
     # ENSEMBLE: a second weights file (glyphnet8.pt) votes per glyph; the
     # higher-confidence read wins disagreements (independent inits/errors)
     # ensemble disabled by default: v10 alone == v10+v9 on the suite, 2x faster.
@@ -436,7 +438,7 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
                 break
     if m2 is not None and res and res[0][0]:
         res2 = glyphnet.classify_many_tta(dom, xcs, baseline, model=m2,
-                                          top2=True)
+                                          top2=True, sizes=sizes)
         merged = []
         for r1, r2 in zip(res, res2):
             c1, f1 = r1[0], r1[1]
