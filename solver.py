@@ -38,7 +38,9 @@ def _bg_median(a: np.ndarray) -> np.ndarray:
     return np.median(flat, axis=0)
 
 
-def analyze(img: Image.Image, diff_thresh: int = 62, min_area: int = 12):
+def analyze(img: Image.Image, diff_thresh: int = 62, min_area: int = 8):
+    # min_area 8 (was 12): the i/j tittle is ~9-16 px at captcha sizes;
+    # dropping it turned i->l and j->i (A/B: +1-2 easy exact).
     """SINGLE pass -> (dom, comps).
     dom:   signed contrast field in [0,1]; glyphs >= 0.875, lines <= 0.75
            (identical to crnn.contrast_field on normal-size images)
@@ -209,7 +211,9 @@ def _split_wide(c: dict, med_w: float, max_depth: int = 2) -> list[dict]:
     # width gate vs the comp's OWN height: mixed-size captchas make a global
     # median width meaningless (a 44px 'M' is 2x a 26px-glyph median and was
     # being cut in half).  Single glyphs are w <= ~1.0h; touching pairs >= 1.4h
-    if c["w"] <= 1.55 * c["h"] or max_depth == 0:
+    # 1.70: 'm' reaches ~1.6-1.7 aspect and was being cut into 'r'+junk;
+    # true touching pairs are >= 1.8h.  (A/B: +1 easy/hard/real each step)
+    if c["w"] <= 1.70 * c["h"] or max_depth == 0:
         return [c]
     col = c["m"].sum(axis=0)
     lo, hi = int(c["w"] * 0.25), int(c["w"] * 0.75)
