@@ -1248,6 +1248,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "train5":
         train_v5(int(sys.argv[2]) if len(sys.argv) > 2 else 12,
                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train11":
+        train_v11(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
     if len(sys.argv) > 1 and sys.argv[1] == "train10":
         train_v10(int(sys.argv[2]) if len(sys.argv) > 2 else 30,
                   int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
