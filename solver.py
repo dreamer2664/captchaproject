@@ -12,6 +12,7 @@ valley split, gap merge, sliver merge), then — when more components than
 expected characters survive (noise lines, page junk) — the most glyph-like
 subset is selected by height band + area.
 """
+import os
 import re
 import string
 import time
@@ -208,7 +209,7 @@ def _split_wide(c: dict, med_w: float, max_depth: int = 2) -> list[dict]:
     # width gate vs the comp's OWN height: mixed-size captchas make a global
     # median width meaningless (a 44px 'M' is 2x a 26px-glyph median and was
     # being cut in half).  Single glyphs are w <= ~1.0h; touching pairs >= 1.4h
-    if c["w"] <= 1.40 * c["h"] or max_depth == 0:
+    if c["w"] <= 1.55 * c["h"] or max_depth == 0:
         return [c]
     col = c["m"].sum(axis=0)
     lo, hi = int(c["w"] * 0.25), int(c["w"] * 0.75)
@@ -422,14 +423,17 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
                  glyphnet.classify_many(dom, xcs, baseline)])
     # ENSEMBLE: a second weights file (glyphnet8.pt) votes per glyph; the
     # higher-confidence read wins disagreements (independent inits/errors)
+    # ensemble disabled by default: v10 alone == v10+v9 on the suite, 2x faster.
+    # GLYPHNET_ENS=1 re-enables voting with the best other weights file.
     m2 = None
-    _main = glyphnet.get_model()
-    for _cand in ("glyphnet10.pt", "glyphnet9.pt", "glyphnet8.pt"):
-        _m = glyphnet.get_model(_cand, quiet=True)
-        if (_m is not None and _m is not _main and getattr(
-                _m, "src_path", "") != getattr(_main, "src_path", "")):
-            m2 = _m
-            break
+    if os.environ.get("GLYPHNET_ENS"):
+        _main = glyphnet.get_model()
+        for _cand in ("glyphnet10.pt", "glyphnet9.pt", "glyphnet8.pt"):
+            _m = glyphnet.get_model(_cand, quiet=True)
+            if (_m is not None and _m is not _main and getattr(
+                    _m, "src_path", "") != getattr(_main, "src_path", "")):
+                m2 = _m
+                break
     if m2 is not None and res and res[0][0]:
         res2 = glyphnet.classify_many_tta(dom, xcs, baseline, model=m2,
                                           top2=True)
@@ -456,6 +460,17 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
     # wins +8 exact easy, +8 hard, +9 real.  Kept for old weights: set
     # POSTPASS = True when evaluating pre-v10 checkpoints.
     mean_conf = sum(r[1] for r in res) / len(res) if res else 0.0
+    # O/0 ASPECT MINI-PASS (the one hand rule that still pays): digit zero is
+    # narrow (aspect < 0.85) in every generator font except monospace.
+    if len(kept) >= 4:
+        ws = np.array([c["w"] for c in kept], dtype=float)
+        mono = (ws.std() / max(ws.mean(), 1e-6) < 0.06
+                and len(set(out)) >= 3)
+        if not mono:
+            for i, c in enumerate(kept):
+                if out[i] in "O0" and c["h"] >= 10:
+                    a = c["w"] / c["h"]
+                    out[i] = "0" if a < 0.85 else "O"
     POSTPASS = False
     if POSTPASS:
         heights = [c["h"] for c in kept]
