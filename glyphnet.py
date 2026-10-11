@@ -991,7 +991,8 @@ def train_v10(epochs: int = 30, patches_per_epoch: int = 24000, batch: int = 128
 
 
 def train_v11(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
-              path: str = "glyphnet11.pt", init: str = "glyphnet10.pt") -> None:
+              path: str = "glyphnet11.pt", init: str = "glyphnet10.pt",
+              lr: float = 2e-4, last_path: str = "") -> None:
     """v11 = v10 recipe, HARD-WEIGHTED: 50% hard / 30% real / 20% easy cards,
     case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
     Suite v10: easy 90 hard 42 real 49; held-out hard per-char 88% vs suite
@@ -1009,7 +1010,7 @@ def train_v11(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128
             model.load_state_dict(sd, strict=False)
             print(f"init from {cand}: {len(sd)} keys carried", flush=True)
             break
-    opt = torch.optim.Adam(model.parameters(), 2e-4)
+    opt = torch.optim.Adam(model.parameters(), lr)
     crit = nn.CrossEntropyLoss()
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
                                                        eta_min=1e-5)
@@ -1074,6 +1075,10 @@ def train_v11(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128
             sd["ch1_whole"] = torch.tensor(1)
             torch.save(sd, path)
             print(f"  saved ({acc:.2%})", flush=True)
+        if last_path:
+            sdl = dict(model.state_dict())
+            sdl["ch1_whole"] = torch.tensor(1)
+            torch.save(sdl, last_path)
     model.eval()
     for style in ("easy", "hard", "real"):
         Xv, Yv = [], []
@@ -1251,6 +1256,13 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "train11":
         train_v11(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
                   int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train11b":
+        # low-lr continuation of the saved v11 best; keeps quick-acc best at
+        # glyphnet11.pt and writes EVERY epoch end to glyphnet11b_last.pt
+        train_v11(int(sys.argv[2]) if len(sys.argv) > 2 else 8,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  path="glyphnet11.pt", init="glyphnet11.pt",
+                  lr=4e-5, last_path="glyphnet11b_last.pt")
     if len(sys.argv) > 1 and sys.argv[1] == "train10":
         train_v10(int(sys.argv[2]) if len(sys.argv) > 2 else 30,
                   int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
