@@ -1143,7 +1143,7 @@ def train_v11(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128
 
 
 def train_v12(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
-              path: str = "glyphnet12.pt", init: str = "glyphnet11.pt",
+              path: str = "glyphnet12.pt", init: str = "glyphnet11b_last.pt",
               lr: float = 2e-4, last_path: str = "") -> None:
     """v12 = v11 recipe + SIZE CHANNEL:: 50% hard / 30% real / 20% easy cards,
     case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
