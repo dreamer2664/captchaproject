@@ -466,17 +466,9 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
     # wins +8 exact easy, +8 hard, +9 real.  Kept for old weights: set
     # POSTPASS = True when evaluating pre-v10 checkpoints.
     mean_conf = sum(r[1] for r in res) / len(res) if res else 0.0
-    # O/0 ASPECT MINI-PASS (the one hand rule that still pays): digit zero is
-    # narrow (aspect < 0.85) in every generator font except monospace.
-    if len(kept) >= 4:
-        ws = np.array([c["w"] for c in kept], dtype=float)
-        mono = (ws.std() / max(ws.mean(), 1e-6) < 0.06
-                and len(set(out)) >= 3)
-        if not mono:
-            for i, c in enumerate(kept):
-                if out[i] in "O0" and c["h"] >= 10:
-                    a = c["w"] / c["h"]
-                    out[i] = "0" if a < 0.85 else "O"
+    # O/0 ASPECT MINI-PASS removed with v12: the size channel lets the case
+    # and identity heads settle O/0 themselves, and the rule had become a net
+    # loss (A/B 100 seeds/style: without it hard 61->62, real 76->78).
     POSTPASS = False
     if POSTPASS:
         heights = [c["h"] for c in kept]
