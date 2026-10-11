@@ -1471,6 +1471,13 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "train5":
         train_v5(int(sys.argv[2]) if len(sys.argv) > 2 else 12,
                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train12b":
+        # low-lr continuation; quick-acc best stays at glyphnet12.pt,
+        # every epoch end also lands in glyphnet12b_last.pt
+        train_v12(int(sys.argv[2]) if len(sys.argv) > 2 else 10,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  path="glyphnet12.pt", init="glyphnet12.pt",
+                  lr=4e-5, last_path="glyphnet12b_last.pt")
     if len(sys.argv) > 1 and sys.argv[1] == "train12":
         train_v12(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
                   int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
