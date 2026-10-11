@@ -422,7 +422,12 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
                  glyphnet.classify_many(dom, xcs, baseline)])
     # ENSEMBLE: a second weights file (glyphnet8.pt) votes per glyph; the
     # higher-confidence read wins disagreements (independent inits/errors)
-    m2 = glyphnet.get_model("glyphnet8.pt", quiet=True)
+    m2 = None
+    for _cand in ("glyphnet10.pt", "glyphnet9.pt", "glyphnet8.pt"):
+        _m = glyphnet.get_model(_cand, quiet=True)
+        if _m is not None and _m is not glyphnet.get_model():
+            m2 = _m
+            break
     if m2 is not None and res and res[0][0]:
         res2 = glyphnet.classify_many_tta(dom, xcs, baseline, model=m2,
                                           top2=True)
@@ -449,12 +454,13 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
     # down to x-height and disables the whole pass).  Heights cluster at
     # {cap/asc} and {x-height}; the widest gap >= 4 px separates them.
     hs = sorted(h for ch, h in zip(out, heights)
-                if ch.lower() not in set("gjpqy"))
+                if ch not in set("gjpqy"))   # lowercase tails only; a
+                # capital Q/G/J/P/Y is cap-height and MUST stay in the mix
     cap = xh = None
     if len(hs) >= 2:
         gaps = np.diff(hs)
         gi = int(np.argmax(gaps))
-        if gaps[gi] >= 4:
+        if gaps[gi] >= 3:
             up, lo = hs[gi + 1:], hs[: gi + 1]
             # uniform-size cards only: mixed sizes smear both clusters and
             # the "lines" become meaningless (hard style keeps mixed sizes)
@@ -505,10 +511,26 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
             out[i] = out[i].upper()
         elif out[i] in set("GJPQY") and bot > baseline + 3:
             out[i] = out[i].lower()
+        # y vs Y: the lowercase tail SLANTS (diagonal), the capital stem is
+        # vertical — descender erosion kills the hang cue, not the slant
+        if out[i] in ("y", "Y") and c["h"] > 12:
+            z0 = c["y"] + int(0.62 * c["h"])
+            zone = c["m"][z0:c["y"] + c["h"]]
+            cents = [float(np.mean(xs)) for r in zone
+                     if (xs := np.where(r > 0)[0]).size]
+            if len(cents) >= 3 and abs(cents[-1] - cents[0]) >= 1.6:
+                out[i] = "y"
+            elif len(cents) >= 3:
+                out[i] = "Y"
     # O vs 0: the zero is markedly narrower than the letter O in every
-    # proportional font; in monospace they are the same width -> skip there
+    # proportional font; in monospace they are the same width -> skip there.
+    # Mono shows up as near-identical advance widths across distinct chars.
+    ws_all = [c["w"] for c in kept]
     mono = any(ch in "1lI" and h > 8 and w / h >= 0.5
-               for ch, w, h in zip(out, [c["w"] for c in kept], heights))
+               for ch, w, h in zip(out, ws_all, heights))
+    if not mono and len(ws_all) >= 4:
+        mw = float(np.mean(ws_all))
+        mono = (float(np.std(ws_all)) / mw) < 0.06 and             len(set(ch.lower() for ch in out)) >= 3
     for i, c in enumerate(kept):
         if out[i] in ("O", "0") and c["h"] > 10 and not mono:
             out[i] = "0" if c["w"] / c["h"] < 0.85 else "O"
