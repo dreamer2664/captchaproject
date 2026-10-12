@@ -80,25 +80,6 @@ def _I_font_truetype(path, size):
     return _IF.truetype(path, size)
 
 
-# --- human-unsolvable glyph/font combos -------------------------------------
-# Measured mask IoU at size 34: STIXGeneral I/l 0.92, 1/l 0.93; DejaVuSansMono
-# O/0 0.84, 1/I 0.85; DejaVu*-Bold I/l 0.83-0.87.  A human cannot call these
-# (the real page IS human-solvable), so the offending char is never drawn in
-# the offending font.  Proxy calibration, not a solver trick.
-AMBIG_EXCLUDE = {
-    "STIXGeneral.ttf": frozenset("Il"),
-    "DejaVuSansMono.ttf": frozenset("OI"),
-    "DejaVuSerif-Bold.ttf": frozenset("l"),
-    "DejaVuSans-Bold.ttf": frozenset("l"),
-}
-
-
-def _pick_char(font_path: str) -> str:
-    ex = AMBIG_EXCLUDE.get(font_path.rsplit("/", 1)[-1])
-    pool = [c for c in CHARS if not ex or c not in ex] if ex else CHARS
-    return random.choice(pool)
-
-
 FONT_FILES = [p for p in _FONT_CANDIDATES
               if _os.path.exists(p) and _font_has_glyphs(p)] or \
              [_FONT_CANDIDATES[4]]
@@ -200,10 +181,9 @@ def generate(length: int | None = None, boxes: bool = False,
     specs = []
     for _ in range(n):
         size = random.randint(26, 44)
-        _f = random.choice(FONT_FILES)
         specs.append(dict(
-            ch=_pick_char(_f),
-            font=_f,
+            ch=random.choice(CHARS),
+            font=random.choice(FONT_FILES),
             size=size,
             color=random.choice(INK_COLORS),
             rot=random.uniform(-12, 12),
@@ -213,7 +193,7 @@ def generate(length: int | None = None, boxes: bool = False,
     widths = []
     for s in specs:
         widths.append(_font(s["font"], s["size"]).getlength(s["ch"]))
-    gaps = [random.randint(1, 5) for _ in range(n)]
+    gaps = [random.randint(0, 4) for _ in range(n)]
     for _shrink in range(6):
         run = sum(widths) + sum(gaps)
         if run <= W - 14:
@@ -281,11 +261,11 @@ def _generate_easy(n: int, boxes: bool):
     card_size = random.randint(30, 40)     # ONE size per card: cap/x-height
     specs = []                             # lines stay exact for case reads
     for _ in range(n):
-        specs.append(dict(ch=_pick_char(font_path), font=font_path,
+        specs.append(dict(ch=random.choice(CHARS), font=font_path,
                           size=card_size, color=ink,
                           rot=random.uniform(-10, 10)))
     widths = [_font(s["font"], s["size"]).getlength(s["ch"]) for s in specs]
-    gaps = [random.randint(3, 7) for _ in range(n)]
+    gaps = [random.randint(2, 6) for _ in range(n)]
     for _shrink in range(6):
         run = sum(widths) + sum(gaps)
         if run <= W - 14:

@@ -1,0 +1,8 @@
+init from glyphnet8.pt: 27 keys carried, 0 re-init
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import glyphnet; glyphnet.train_v8(40, 24000, 128, 'glyphnet8.pt', 'glyphnet8.pt')
+    ^^^^^^^^^^^^^^^
+  File "/home/user/ocr-typer/glyphnet.py", line 19, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'

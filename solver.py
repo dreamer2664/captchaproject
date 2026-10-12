@@ -12,7 +12,6 @@ valley split, gap merge, sliver merge), then — when more components than
 expected characters survive (noise lines, page junk) — the most glyph-like
 subset is selected by height band + area.
 """
-import os
 import re
 import string
 import time
@@ -38,9 +37,7 @@ def _bg_median(a: np.ndarray) -> np.ndarray:
     return np.median(flat, axis=0)
 
 
-def analyze(img: Image.Image, diff_thresh: int = 62, min_area: int = 8):
-    # min_area 8 (was 12): the i/j tittle is ~9-16 px at captcha sizes;
-    # dropping it turned i->l and j->i (A/B: +1-2 easy exact).
+def analyze(img: Image.Image, diff_thresh: int = 62, min_area: int = 12):
     """SINGLE pass -> (dom, comps).
     dom:   signed contrast field in [0,1]; glyphs >= 0.875, lines <= 0.75
            (identical to crnn.contrast_field on normal-size images)
@@ -211,9 +208,7 @@ def _split_wide(c: dict, med_w: float, max_depth: int = 2) -> list[dict]:
     # width gate vs the comp's OWN height: mixed-size captchas make a global
     # median width meaningless (a 44px 'M' is 2x a 26px-glyph median and was
     # being cut in half).  Single glyphs are w <= ~1.0h; touching pairs >= 1.4h
-    # 1.70: 'm' reaches ~1.6-1.7 aspect and was being cut into 'r'+junk;
-    # true touching pairs are >= 1.8h.  (A/B: +1 easy/hard/real each step)
-    if c["w"] <= 1.70 * c["h"] or max_depth == 0:
+    if c["w"] <= 1.40 * c["h"] or max_depth == 0:
         return [c]
     col = c["m"].sum(axis=0)
     lo, hi = int(c["w"] * 0.25), int(c["w"] * 0.75)
@@ -376,12 +371,6 @@ def read_template(img: Image.Image, expected_len: int | None = None) -> str:
 
 
 AMBIG_CASE = set("acemnorsuvwxz")   # x-height shapes: case = pure scale
-# mixed-size cards have no cap/x-height LINES, but glyph aspect (w/h) still
-# separates case for these shapes (measured over all 6 captive fonts):
-# char -> (aspect midpoint, +1 if lowercase is wider, -1 if narrower)
-ASPECT_CASE = {"m": (1.30, 1), "e": (0.835, 1), "r": (0.815, -1),
-               "w": (1.35, 1), "x": (0.975, 1), "u": (0.935, 1),
-               "v": (1.00, 1), "n": (0.95, 1)}
 XHEIGHT_REF = set("acemnr")          # unambiguous x-height-only shapes
 
 
@@ -421,152 +410,86 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
     for c in kept:
         ys, xs = np.where(c["m"])
         xcs.append(c["x"] + float(xs.mean()))
-    sizes = [float(c["h"]) for c in kept]
-    res = (glyphnet.classify_many_tta(dom, xcs, baseline, top2=True,
-                                      sizes=sizes)
+    res = (glyphnet.classify_many_tta(dom, xcs, baseline)
            if getattr(glyphnet.get_model(), "tta", True)
-           else [(ch, cf, ch) for ch, cf in
-                 glyphnet.classify_many(dom, xcs, baseline, sizes=sizes)])
+           else glyphnet.classify_many(dom, xcs, baseline))
     # ENSEMBLE: a second weights file (glyphnet8.pt) votes per glyph; the
     # higher-confidence read wins disagreements (independent inits/errors)
-    # ensemble disabled by default: v10 alone == v10+v9 on the suite, 2x faster.
-    # GLYPHNET_ENS=1 re-enables voting with the best other weights file.
-    m2 = None
-    if os.environ.get("GLYPHNET_ENS"):
-        _main = glyphnet.get_model()
-        for _cand in ("glyphnet13_last.pt", "glyphnet12b_last.pt",
-                      "glyphnet12.pt", "glyphnet11b_last.pt"):
-            _m = glyphnet.get_model(_cand, quiet=True)
-            if (_m is not None and _m is not _main and getattr(
-                    _m, "src_path", "") != getattr(_main, "src_path", "")):
-                m2 = _m
-                break
+    m2 = glyphnet.get_model("glyphnet8.pt", quiet=True)
     if m2 is not None and res and res[0][0]:
-        res2 = glyphnet.classify_many_tta(dom, xcs, baseline, model=m2,
-                                          top2=True, sizes=sizes)
+        res2 = glyphnet.classify_many_tta(dom, xcs, baseline, model=m2)
         merged = []
-        for r1, r2 in zip(res, res2):
-            c1, f1 = r1[0], r1[1]
-            c2, f2 = r2[0], r2[1]
+        for (c1, f1), (c2, f2) in zip(res, res2):
             if c1 == c2:
-                merged.append((c1, (f1 + f2) / 2, r1[2]))
+                merged.append((c1, (f1 + f2) / 2))
             else:
-                merged.append((c1, f1, r1[2]) if f1 >= f2
-                              else (c2, f2, r2[2]))
+                merged.append((c1, f1 * 1.0) if f1 >= f2 else (c2, f2))
         res = merged
-    out = [r[0] for r in res]
-    confs = [r[1] for r in res]
-    runners = [r[2] for r in res]
+    out = [ch for ch, _ in res]
+    confs = [cf for _, cf in res]
     # CASE POST-PASS (all models): vertical geometry is exact information —
     # cap line vs x-height line separate 'C' from 'c' with ~10 px of margin.
     # The CNN case head gets a vote, but a glyph sitting ON the x-height line
     # is lowercase no matter what the head thought.
-    # CASE POST-PASSES (bimodal case, aspect prior, geometry pass2, template
-    # verifier): DISABLED for v10+ weights.  The case head (loss x2, estimator
-    # anchors) now beats every hand-made rule -- A/B on 60 seeds/style: raw
-    # wins +8 exact easy, +8 hard, +9 real.  Kept for old weights: set
-    # POSTPASS = True when evaluating pre-v10 checkpoints.
-    mean_conf = sum(r[1] for r in res) / len(res) if res else 0.0
-    # O/0 ASPECT MINI-PASS removed with v12: the size channel lets the case
-    # and identity heads settle O/0 themselves, and the rule had become a net
-    # loss (A/B 100 seeds/style: without it hard 61->62, real 76->78).
-    POSTPASS = False
-    if POSTPASS:
-        heights = [c["h"] for c in kept]
-        # LINE ESTIMATE by BIMODAL HEIGHT SPLIT: class-medians get polluted by the
-        # very misreads we are fixing (one 'S' read for 's' drags the cap median
-        # down to x-height and disables the whole pass).  Heights cluster at
-        # {cap/asc} and {x-height}; the widest gap >= 4 px separates them.
-        hs = sorted(h for ch, h in zip(out, heights)
-                    if ch not in set("gjpqy"))   # lowercase tails only; a
-                    # capital Q/G/J/P/Y is cap-height and MUST stay in the mix
-        cap = xh = None
-        if len(hs) >= 2:
-            gaps = np.diff(hs)
-            gi = int(np.argmax(gaps))
-            if gaps[gi] >= 3:
-                up, lo = hs[gi + 1:], hs[: gi + 1]
-                # uniform-size cards only: mixed sizes smear both clusters and
-                # the "lines" become meaningless (hard style keeps mixed sizes)
-                if (max(up) - min(up) <= 4) and (max(lo) - min(lo) <= 4):
-                    cap = float(np.median(up))
-                    xh = float(np.median(lo))
-        if cap is not None and xh is not None:
-            if cap - xh > 3:
-                for i, ch in enumerate(out):
-                    if ch.lower() in AMBIG_CASE and abs(heights[i] - cap) != abs(heights[i] - xh):
-                        want_upper = abs(heights[i] - cap) < abs(heights[i] - xh)
-                        out[i] = ch.upper() if want_upper else ch.lower()
-        # ASPECT CASE PRIOR for mixed-size cards (bimodal lines unavailable)
-        if cap is None:
-            for i, c in enumerate(kept):
-                low = out[i].lower()
-                if low in ASPECT_CASE and confs[i] < 0.60 and c["h"] > 10:
-                    mid, sgn = ASPECT_CASE[low]
-                    a = c["w"] / c["h"]
-                    if abs(a - mid) >= 0.05:
-                        want_lower = (a > mid) if sgn == 1 else (a < mid)
-                        out[i] = low if want_lower else low.upper()
-
-        # GEOMETRY PASS 2: dot-gap and descender cues are exact information the
-        # CNN head keeps getting wrong (l/i 47 flips, J/j 43, Z/z 38 in mining).
-        #   i,j  : tittle = a row-gap inside the bbox;  l : stem continuous
-        #   gjpqy: lowercase tail hangs BELOW baseline; capitals stop at it
-        for i, c in enumerate(kept):
-            rows = c["m"].sum(axis=1)
-            top = int(np.argmax(rows > 0))
-            zone = rows[top + 2: top + max(3, int(0.45 * c["h"]))]
-            gap = bool(zone.size and 0 in zone)
-            bot = c["y"] + c["h"]
-            ch = out[i]
-            if ch in ("i", "j") and not gap:
-                out[i] = "j" if bot > baseline + 3 else "l"
-                if out[i] == "l" and ch == "j":
-                    out[i] = "J" if bot <= baseline + 3 else "j"
-            elif ch == "l" and gap:
-                out[i] = "j" if bot > baseline + 3 else "i"
-            # descender = a THIN TAIL in the bottom quarter (stem width), vs the
-            # wide bowl/curve a capital ends with.  Baseline-free: rotation moves
-            # component bottoms +-4 px and made baseline rules misfire.
-            # descender = thin tail AND a hang below the no-tail baseline.
-            # J/P/Y have thin hooks but stop AT the line; rotated cards move
-            # plain baseline medians +-3 px, base2 (no-tail comps) is stable.
-            if out[i] in set("gjpqy") and bot <= baseline + 2:
-                out[i] = out[i].upper()
-            elif out[i] in set("GJPQY") and bot > baseline + 3:
-                out[i] = out[i].lower()
-            # y vs Y: the lowercase tail SLANTS (diagonal), the capital stem is
-            # vertical — descender erosion kills the hang cue, not the slant
-            if out[i] in ("y", "Y") and c["h"] > 12:
-                z0 = c["y"] + int(0.62 * c["h"])
-                zone = c["m"][z0:c["y"] + c["h"]]
-                cents = [float(np.mean(xs)) for r in zone
-                         if (xs := np.where(r > 0)[0]).size]
-                if len(cents) >= 3 and abs(cents[-1] - cents[0]) >= 1.6:
-                    out[i] = "y"
-                elif len(cents) >= 3:
-                    out[i] = "Y"
-        # O vs 0: the zero is markedly narrower than the letter O in every
-        # proportional font; in monospace they are the same width -> skip there.
-        # Mono shows up as near-identical advance widths across distinct chars.
-        ws_all = [c["w"] for c in kept]
-        mono = any(ch in "1lI" and h > 8 and w / h >= 0.5
-                   for ch, w, h in zip(out, ws_all, heights))
-        if not mono and len(ws_all) >= 4:
-            mw = float(np.mean(ws_all))
-            mono = (float(np.std(ws_all)) / mw) < 0.06 and             len(set(ch.lower() for ch in out)) >= 3
-        for i, c in enumerate(kept):
-            if out[i] in ("O", "0") and c["h"] > 10 and not mono:
-                out[i] = "0" if c["w"] / c["h"] < 0.85 else "O"
-        # TEMPLATE VERIFIER: on low-margin CNN reads, settle top-1 vs top-2 with
-        # exact font templates (same font files the captchas are drawn with).
-        import templates
-        for i, c in enumerate(kept):
-            if confs[i] < 0.55 and runners[i] != out[i]:
-                sc = templates.score_candidates(upright(c["m"]),
-                                                (out[i], runners[i]))
-                if sc[0] != sc[1] and abs(sc[0] - sc[1]) >= 0.05:
-                    out[i] = out[i] if sc[0] > sc[1] else runners[i]
+    heights = [c["h"] for c in kept]
+    # LINE ESTIMATE by BIMODAL HEIGHT SPLIT: class-medians get polluted by the
+    # very misreads we are fixing (one 'S' read for 's' drags the cap median
+    # down to x-height and disables the whole pass).  Heights cluster at
+    # {cap/asc} and {x-height}; the widest gap >= 4 px separates them.
+    hs = sorted(h for ch, h in zip(out, heights)
+                if ch.lower() not in set("gjpqy"))
+    cap = xh = None
+    if len(hs) >= 2:
+        gaps = np.diff(hs)
+        gi = int(np.argmax(gaps))
+        if gaps[gi] >= 4:
+            up, lo = hs[gi + 1:], hs[: gi + 1]
+            # uniform-size cards only: mixed sizes smear both clusters and
+            # the "lines" become meaningless (hard style keeps mixed sizes)
+            if (max(up) - min(up) <= 4) and (max(lo) - min(lo) <= 4):
+                cap = float(np.median(up))
+                xh = float(np.median(lo))
+    if cap is not None and xh is not None:
+        if cap - xh > 3:
+            for i, ch in enumerate(out):
+                if ch.lower() in AMBIG_CASE and abs(heights[i] - cap) != abs(heights[i] - xh):
+                    want_upper = abs(heights[i] - cap) < abs(heights[i] - xh)
+                    out[i] = ch.upper() if want_upper else ch.lower()
+    # GEOMETRY PASS 2: dot-gap and descender cues are exact information the
+    # CNN head keeps getting wrong (l/i 47 flips, J/j 43, Z/z 38 in mining).
+    #   i,j  : tittle = a row-gap inside the bbox;  l : stem continuous
+    #   gjpqy: lowercase tail hangs BELOW baseline; capitals stop at it
+    for i, c in enumerate(kept):
+        rows = c["m"].sum(axis=1)
+        top = int(np.argmax(rows > 0))
+        zone = rows[top + 2: top + max(3, int(0.45 * c["h"]))]
+        gap = bool(zone.size and 0 in zone)
+        bot = c["y"] + c["h"]
+        ch = out[i]
+        if ch in ("i", "j") and not gap:
+            out[i] = "j" if bot > baseline + 3 else "l"
+            if out[i] == "l" and ch == "j":
+                out[i] = "J" if bot <= baseline + 3 else "j"
+        elif ch == "l" and gap:
+            out[i] = "j" if bot > baseline + 3 else "i"
+        # descender = a THIN TAIL in the bottom quarter (stem width), vs the
+        # wide bowl/curve a capital ends with.  Baseline-free: rotation moves
+        # component bottoms +-4 px and made baseline rules misfire.
+        # descender = thin tail AND a hang below the no-tail baseline.
+        # J/P/Y have thin hooks but stop AT the line; rotated cards move
+        # plain baseline medians +-3 px, base2 (no-tail comps) is stable.
+        if out[i] in set("gjpqy") and bot <= baseline + 2:
+            out[i] = out[i].upper()
+        elif out[i] in set("GJPQY") and bot > baseline + 3:
+            out[i] = out[i].lower()
+    # O vs 0: the zero is markedly narrower than the letter O in every
+    # proportional font; in monospace they are the same width -> skip there
+    mono = any(ch in "1lI" and h > 8 and w / h >= 0.5
+               for ch, w, h in zip(out, [c["w"] for c in kept], heights))
+    for i, c in enumerate(kept):
+        if out[i] in ("O", "0") and c["h"] > 10 and not mono:
+            out[i] = "0" if c["w"] / c["h"] < 0.85 else "O"
+    mean_conf = sum(confs) / len(confs) if confs else 0.0
     return "".join(out), mean_conf, kept, dropped, dom
 
 
