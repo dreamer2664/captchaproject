@@ -548,13 +548,14 @@ def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
                  glyphnet.classify_many(dom, xcs, baseline, sizes=sizes)])
     # ENSEMBLE: a second weights file (glyphnet8.pt) votes per glyph; the
     # higher-confidence read wins disagreements (independent inits/errors)
-    # ensemble disabled by default: v10 alone == v10+v9 on the suite, 2x faster.
-    # GLYPHNET_ENS=1 re-enables voting with the best other weights file.
+    # v15: ensemble ON by default (ep7 + ep20 checkpoints vote per glyph;
+    # hard 84->86, latency +~50ms/img, trivial vs the 14 s budget).
+    # GLYPHNET_ENS=0 disables.
     m2 = None
-    if os.environ.get("GLYPHNET_ENS"):
+    if os.environ.get("GLYPHNET_ENS", "1") != "0":
         _main = glyphnet.get_model()
-        for _cand in ("glyphnet13_last.pt", "glyphnet12b_last.pt",
-                      "glyphnet12.pt", "glyphnet11b_last.pt"):
+        for _cand in ("glyphnet15b.pt", "glyphnet13_last.pt",
+                      "glyphnet12b_last.pt", "glyphnet12.pt"):
             _m = glyphnet.get_model(_cand, quiet=True)
             if (_m is not None and _m is not _main and getattr(
                     _m, "src_path", "") != getattr(_main, "src_path", "")):

@@ -29,3 +29,21 @@ epoch 23/40 loss 0.4418 char-acc 99.50% lr 8.28e-05 (278s)
 epoch 24/40 loss 0.4289 char-acc 99.57% lr 7.56e-05 (198s)
 epoch 25/40 loss 0.4379 char-acc 99.47% lr 6.86e-05 (233s)
 epoch 26/40 loss 0.4289 char-acc 99.50% lr 6.19e-05 (306s)
+epoch 27/40 loss 0.4222 char-acc 99.53% lr 5.54e-05 (169s)
+epoch 28/40 loss 0.4247 char-acc 99.43% lr 4.92e-05 (168s)
+epoch 29/40 loss 0.4015 char-acc 99.50% lr 4.33e-05 (169s)
+epoch 30/40 loss 0.4070 char-acc 99.37% lr 3.78e-05 (168s)
+epoch 31/40 loss 0.4123 char-acc 99.53% lr 3.28e-05 (167s)
+epoch 32/40 loss 0.4144 char-acc 99.50% lr 2.81e-05 (168s)
+epoch 33/40 loss 0.4225 char-acc 99.40% lr 2.40e-05 (169s)
+epoch 34/40 loss 0.4090 char-acc 99.50% lr 2.04e-05 (167s)
+epoch 35/40 loss 0.4148 char-acc 99.37% lr 1.72e-05 (168s)
+epoch 36/40 loss 0.4184 char-acc 99.40% lr 1.46e-05 (169s)
+epoch 37/40 loss 0.4182 char-acc 99.47% lr 1.26e-05 (167s)
+epoch 38/40 loss 0.4166 char-acc 99.50% lr 1.12e-05 (169s)
+epoch 39/40 loss 0.4197 char-acc 99.43% lr 1.03e-05 (171s)
+epoch 40/40 loss 0.4055 char-acc 99.40% lr 1.00e-05 (167s)
+held-out easy: 98.74%
+held-out hard: 95.45%
+held-out real: 95.65%
+model loaded: True
