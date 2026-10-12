@@ -37,7 +37,8 @@ def main():
             base_j = None
             for ch, (xc, base, _sz) in zip(truth, boxes):
                 p = glyphnet.patch(dom, xc + jit.uniform(-1.5, 1.5),
-                                   base + jit.uniform(-2, 2))
+                                   base + jit.uniform(-2, 2),
+                                   getattr(m, "ch1_whole", False))
                 import torch
                 with torch.no_grad():
                     out = m(torch.from_numpy(p[None]).float())

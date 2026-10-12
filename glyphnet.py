@@ -33,16 +33,28 @@ WID = 84          # wide patch: neighbours visible => relative case cues
 UP, DOWN, SIDE = 40, 16, 42
 
 
-def _shape_channel(mask_win: np.ndarray) -> np.ndarray:
-    """largest component of window, square-normalized to 28, centred"""
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask_win.astype(np.uint8), 8)
+def _shape_channel(mask_win: np.ndarray, whole: bool = False) -> np.ndarray:
+    """square-normalized to 28, centred.  whole=True keeps the ENTIRE window
+    mask (tittles visible: l vs i separable); whole=False keeps only the
+    largest component (what v5-v8 weights were trained with — the channel
+    version MUST match the weights or accuracy collapses)."""
     canv = np.zeros((P, WID), np.float32)
-    if n <= 1:
-        return canv
-    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    x, y, w, h = (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
-                  stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
-    m = (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255
+    if whole:
+        ys, xs = np.where(mask_win > 0)
+        if len(xs) == 0:
+            return canv
+        x, y = int(xs.min()), int(ys.min())
+        w, h = int(xs.max()) - x + 1, int(ys.max()) - y + 1
+        m = mask_win[y:y + h, x:x + w].astype(np.uint8) * 255
+    else:
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(
+            mask_win.astype(np.uint8), 8)
+        if n <= 1:
+            return canv
+        i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        x, y, w, h = (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+                      stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
+        m = (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255
     s = max(h, w)
     sq = np.zeros((s, s), np.uint8)
     sq[(s - h) // 2:(s - h) // 2 + h, (s - w) // 2:(s - w) // 2 + w] = m
@@ -51,8 +63,12 @@ def _shape_channel(mask_win: np.ndarray) -> np.ndarray:
     return canv
 
 
-def patch(dom: np.ndarray, xc: float, base: float) -> np.ndarray:
-    """2-channel 56x56 patch around (xc, baseline)."""
+def patch(dom: np.ndarray, xc: float, base: float,
+          whole: bool = False, size_h: float | None = None) -> np.ndarray:
+    """2-channel 56x84 patch around (xc, baseline); size_h adds a 3rd
+    constant plane encoding the component height (v12: patches normalize
+    away absolute size, which made V/v, X/x shape-identical for the case
+    head on mixed-size cards)."""
     H, W = dom.shape
     x0, y0 = int(round(xc)) - SIDE, int(round(base)) - UP
     ch0 = np.zeros((P, WID), np.float32)
@@ -65,8 +81,12 @@ def patch(dom: np.ndarray, xc: float, base: float) -> np.ndarray:
     wxs1, wys1 = min(W, wx0 + 32), min(H, wy0 + 54)
     win[wys0 - wy0:wys1 - wy0, wxs0 - wx0:wxs1 - wx0] = dom[wys0:wys1, wxs0:wxs1]
     m = (win > 0.78).astype(np.uint8)  # lines cap at dom 0.75: never pass
-    ch1 = _shape_channel(m)
-    return np.stack([ch0, ch1])
+    ch1 = _shape_channel(m, whole)
+    if size_h is None:
+        return np.stack([ch0, ch1])
+    ch2 = np.full((P, WID), float(min(max(size_h / 40.0, 0.3), 1.4)),
+                  np.float32)
+    return np.stack([ch0, ch1, ch2])
 
 
 # case-folded identity: 0-9 digits, then a-z  (36 classes)
@@ -102,13 +122,21 @@ class GlyphNet(nn.Module):
     in its own file and the solver picks whichever verifies better."""
 
     def __init__(self, n: int = len(ALPHABET), multitask: bool = True,
-                 wide: bool = False):
+                 wide: bool = False, size_ch: bool = False):
         super().__init__()
         self.multitask = multitask
         self.wide = wide
+        # v12: channel 2 is a constant plane holding the component height / 40.
+        # Patch crops are re-framed to a fixed box, so absolute glyph size is
+        # LOST in channels 0-1 -- and hard cards mix sizes 26-44 per char,
+        # which is exactly the V/v, X/x, W/w, S/s case signal.  Feeding the
+        # height back as its own channel restores it.
+        self.size_ch = size_ch
+        self.in_ch = 3 if size_ch else 2
         fc = 384 if wide else 192
         self.trunk = nn.Sequential(
-            nn.Conv2d(2, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(True),
+            nn.Conv2d(self.in_ch, 32, 3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(True),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
             nn.MaxPool2d(2),
@@ -159,11 +187,15 @@ def get_model(path: str = "glyphnet.pt", quiet: bool = False):
             sd = {("head." + k.split(".", 2)[2] if k.startswith("net.16.")
                    else "trunk." + k.split(".", 1)[1]): v
                   for k, v in sd.items()}
+        ch1w = bool(sd.pop("ch1_whole", False))
+        sizech = bool(sd.pop("size_ch", False))
         wide = any(k == "trunk.13.weight" and v.shape[0] == 384
                    for k, v in sd.items())
         m = GlyphNet(multitask=any(k.startswith("head_id") for k in sd),
-                     wide=wide)
+                     wide=wide, size_ch=sizech)
         m.load_state_dict(sd)
+        m.ch1_whole = ch1w
+        m.src_path = os.path.abspath(path)
         m.eval()
         if path == "glyphnet.pt":
             _model = m
@@ -183,7 +215,8 @@ def classify(dom: np.ndarray, xc: float, base: float):
     m = get_model()
     if m is None:
         return "", 0.0
-    x = torch.from_numpy(patch(dom, xc, base)[None]).float()
+    x = torch.from_numpy(
+        patch(dom, xc, base, getattr(m, "ch1_whole", False))[None]).float()
     with torch.no_grad():
         out = m(x)
         if getattr(m, "multitask", False):
@@ -195,12 +228,16 @@ def classify(dom: np.ndarray, xc: float, base: float):
     return ALPHABET[i], float(p[i])
 
 
-def classify_many(dom: np.ndarray, xcs, base: float):
+def classify_many(dom: np.ndarray, xcs, base: float, sizes=None):
     """ONE batched forward for all glyphs -> [(char, confidence), ...]"""
     m = get_model()
     if m is None or len(xcs) == 0:
         return [("", 0.0)] * len(xcs)
-    x = torch.from_numpy(np.stack([patch(dom, xc, base) for xc in xcs])).float()
+    sz = sizes if getattr(m, "size_ch", False) else None
+    x = torch.from_numpy(np.stack(
+        [patch(dom, xc, base, getattr(m, "ch1_whole", False),
+               size_h=(sz[i] if sz else None))
+         for i, xc in enumerate(xcs)])).float()
     with torch.no_grad():
         out = m(x)
         if getattr(m, "multitask", False):
@@ -218,18 +255,24 @@ def classify_many(dom: np.ndarray, xcs, base: float):
 
 def classify_many_tta(dom: np.ndarray, xcs, base: float, model=None,
                       jitters=((0.0, 0.0), (-1.5, 0.0), (1.5, 0.0),
-                               (0.0, -1.0), (0.0, 1.0))):
+                               (0.0, -1.0), (0.0, 1.0)), top2=False,
+                      sizes=None):
     """TTA: average the softmax evidence over sub-pixel x-jitters.
     Rotated/AA glyphs sit near patch-grid boundaries; one forward per jitter
-    costs ~1 ms each and removes a whole class of flip-flop errors."""
+    costs ~1 ms each and removes a whole class of flip-flop errors.
+    top2=True also returns the runner-up char per glyph (verifier use)."""
     m = model if model is not None else get_model()
     if m is None or len(xcs) == 0:
         return [("", 0.0)] * len(xcs)
+    sz = sizes if getattr(m, "size_ch", False) else None
     outs = []
     with torch.no_grad():
         for jx, jy in jitters:
             x = torch.from_numpy(
-                np.stack([patch(dom, xc + jx, base + jy) for xc in xcs])
+                np.stack([patch(dom, xc + jx, base + jy,
+                                getattr(m, "ch1_whole", False),
+                                size_h=(sz[i] if sz else None))
+                          for i, xc in enumerate(xcs)])
             ).float()
             o = m(x)
             if getattr(m, "multitask", False):
@@ -245,11 +288,20 @@ def classify_many_tta(dom: np.ndarray, xcs, base: float, model=None,
         conf = pi.gather(1, ii[:, None])[:, 0] * pc.gather(1, cc[:, None])[:, 0]
         res = [(char_of(int(a), int(b)), float(c))
                for a, b, c in zip(ii, cc, conf)]
+        if top2:
+            case = int(cc[0]) if len(cc) else 0
+            order = pi.argsort(1, descending=True)[:, :2]
+            res = [(r[0], r[1],
+                    char_of(int(order[i, 1]), case)) for i, r in enumerate(res)]
     else:
         p = sum(o[0] for o in outs) / len(outs)
         idx = p.argmax(1)
         conf = p.gather(1, idx[:, None])[:, 0]
         res = [(ALPHABET[int(i)], float(c)) for i, c in zip(idx, conf)]
+        if top2:
+            order = p.argsort(1, descending=True)[:, :2]
+            res = [(r[0], r[1], ALPHABET[int(order[i, 1])])
+                   for i, r in enumerate(res)]
     return res
 
 
@@ -836,7 +888,806 @@ def train_v8(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
         print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
 
 
-def _fresh_batch(batch: int, seed: int):
+def _est_anchor(dom, comps, xc_true, base_true):
+    """the anchor the INFERENCE pipeline will actually use for this glyph:
+    ink centroid of its component + the shared baseline estimate.  Training
+    on truth anchors left a systematic train/infer gap (suite per-char ran
+    ~4 pts below held-out)."""
+    if not comps:
+        return xc_true, base_true
+    best, bd = None, 9.0
+    for c in comps:
+        ys, xs = np.where(c["m"])
+        if len(xs) == 0:
+            continue
+        ccx = c["x"] + float(xs.mean())
+        d = abs(ccx - xc_true)
+        if d < bd:
+            best, bd = (ccx, c), d
+    if best is None:
+        return xc_true, base_true
+    import solver
+    return best[0], solver._baseline(comps)
+
+
+def _est_anchor_h(dom, comps, xc_true, base_true):
+    """like _est_anchor but also returns the chosen component's height (the
+    size feature v12 feeds as channel 2; inference has kept[i]['h'])."""
+    ex, eb = _est_anchor(dom, comps, xc_true, base_true)
+    h = None
+    if comps:
+        best, bd = None, 9.0
+        for c in comps:
+            ys, xs = np.where(c["m"])
+            if len(xs) == 0:
+                continue
+            d = abs(c["x"] + float(xs.mean()) - xc_true)
+            if d < bd:
+                best, bd = c, d
+        if best is not None:
+            h = float(best["h"])
+    return ex, eb, h
+
+
+def train_v10(epochs: int = 30, patches_per_epoch: int = 24000, batch: int = 128,
+              path: str = "glyphnet10.pt", init: str = "glyphnet9.pt") -> None:
+    """v10 = v9 recipe but patches anchored EXACTLY where inference anchors
+    them (component ink centroid + estimated baseline), so the network never
+    sees a patch shape the runner will not produce."""
+    import os
+    import solver
+    model = GlyphNet(multitask=True, wide=True)
+    for cand in (init, "glyphnet8.pt", "glyphnet7.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            sd.pop("ch1_whole", None)
+            own = model.state_dict()
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), 3e-4)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 777001
+    rng = np.random.default_rng(11)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            random.seed(seed)
+            xs_l, yid, ycase = [], [], []
+            while len(xs_l) < batch:
+                style = ("easy", "hard", "real")[len(xs_l) % 3]
+                img, truth, boxes = generate(style=style, boxes=True)
+                dom, comps = solver.analyze(solver.norm_scale(img))
+                for ch, (xc, base, _sz) in zip(truth, boxes):
+                    if len(xs_l) >= batch:
+                        break
+                    ex, eb = _est_anchor(dom, comps, xc, base)
+                    if abs(ex - xc) > 6:      # merged/split: skip label noise
+                        continue
+                    xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                                      eb + rng.uniform(-2, 2), True))
+                    yid.append(id36_of(ch))
+                    ycase.append(case_of(ch))
+            xn = np.stack(xs_l)
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np(xn[k], rng)
+                if rng.random() < 0.7:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.4:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice((0.8, 1.25))
+            x = torch.from_numpy(xn) + 0.02 * torch.rand(len(xn), 2, P, WID) - 0.01
+            yt = torch.tensor(yid, dtype=torch.long)
+            yc = torch.tensor(ycase, dtype=torch.long)
+            li, lc = model(x)
+            loss = crit(li, yt) + 2.0 * crit(lc, yc)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yt)
+            seen += len(yt)
+        sched.step()
+        acc = _quick_acc(model, 4000, seed=999, whole=True)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom, comps = solver.analyze(solver.norm_scale(img))
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                ex, eb = _est_anchor(dom, comps, xc, base)
+                Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
+                                eb + jr.uniform(-2, 2), True))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+def train_v11(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
+              path: str = "glyphnet11.pt", init: str = "glyphnet10.pt",
+              lr: float = 2e-4, last_path: str = "") -> None:
+    """v11 = v10 recipe, HARD-WEIGHTED: 50% hard / 30% real / 20% easy cards,
+    case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
+    Suite v10: easy 90 hard 42 real 49; held-out hard per-char 88% vs suite
+    81% -> the remaining hard loss is selection/seg + case under clutter."""
+    import os
+    import solver
+    model = GlyphNet(multitask=True, wide=True)
+    for cand in (init, "glyphnet8.pt", "glyphnet7.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            sd.pop("ch1_whole", None)
+            own = model.state_dict()
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), lr)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 888001
+    rng = np.random.default_rng(11)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            random.seed(seed)
+            xs_l, yid, ycase = [], [], []
+            while len(xs_l) < batch:
+                style = ("easy", "hard", "hard", "real", "real",
+                         "hard", "easy", "hard", "real", "hard")[len(xs_l) % 10]
+                img, truth, boxes = generate(style=style, boxes=True)
+                dom, comps = solver.analyze(solver.norm_scale(img))
+                for ch, (xc, base, _sz) in zip(truth, boxes):
+                    if len(xs_l) >= batch:
+                        break
+                    ex, eb = _est_anchor(dom, comps, xc, base)
+                    if abs(ex - xc) > 6:      # merged/split: skip label noise
+                        continue
+                    xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                                      eb + rng.uniform(-2, 2), True))
+                    yid.append(id36_of(ch))
+                    ycase.append(case_of(ch))
+            xn = np.stack(xs_l)
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np(xn[k], rng)
+                if rng.random() < 0.8:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.5:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice((0.8, 1.25))
+                if rng.random() < 0.3:      # AA/clutter bleed: 1px morph
+                    k3 = np.ones((3, 3), np.uint8)
+                    op = cv2.erode if rng.random() < 0.5 else cv2.dilate
+                    xn[k, 1] = op(xn[k, 1], k3, iterations=1)
+            x = torch.from_numpy(xn) + 0.02 * torch.rand(len(xn), 2, P, WID) - 0.01
+            yt = torch.tensor(yid, dtype=torch.long)
+            yc = torch.tensor(ycase, dtype=torch.long)
+            li, lc = model(x)
+            loss = crit(li, yt) + 3.0 * crit(lc, yc)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yt)
+            seen += len(yt)
+        sched.step()
+        acc = _quick_acc(model, 4000, seed=999, whole=True)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+        if last_path:
+            sdl = dict(model.state_dict())
+            sdl["ch1_whole"] = torch.tensor(1)
+            torch.save(sdl, last_path)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom, comps = solver.analyze(solver.norm_scale(img))
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                ex, eb = _est_anchor(dom, comps, xc, base)
+                Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
+                                eb + jr.uniform(-2, 2), True))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+def train_v12(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
+              path: str = "glyphnet12.pt", init: str = "glyphnet11b_last.pt",
+              lr: float = 2e-4, last_path: str = "") -> None:
+    """v12 = v11 recipe + SIZE CHANNEL:: 50% hard / 30% real / 20% easy cards,
+    case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
+    Suite v10: easy 90 hard 42 real 49; held-out hard per-char 88% vs suite
+    81% -> the remaining hard loss is selection/seg + case under clutter."""
+    import os
+    import solver
+    model = GlyphNet(multitask=True, wide=True, size_ch=True)
+    for cand in (init, "glyphnet8.pt", "glyphnet7.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            sd.pop("ch1_whole", None)
+            own = model.state_dict()
+            k0 = "trunk.0.weight"
+            if (k0 in sd and k0 in own and sd[k0].shape[1] == 2
+                    and own[k0].shape[1] == 3):
+                w = torch.zeros(own[k0].shape)
+                w[:, :2] = sd[k0]
+                sd[k0] = w
+                print("conv1 padded 2ch -> 3ch (size channel zero-init)",
+                      flush=True)
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), lr)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 888001
+    rng = np.random.default_rng(11)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            random.seed(seed)
+            xs_l, yid, ycase = [], [], []
+            while len(xs_l) < batch:
+                style = ("easy", "hard", "hard", "real", "real",
+                         "hard", "easy", "hard", "real", "hard")[len(xs_l) % 10]
+                img, truth, boxes = generate(style=style, boxes=True)
+                dom, comps = solver.analyze(solver.norm_scale(img))
+                for ch, (xc, base, _sz) in zip(truth, boxes):
+                    if len(xs_l) >= batch:
+                        break
+                    ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                    if abs(ex - xc) > 6 or eh is None:
+                        continue               # merged/split: skip label noise
+                    xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                                      eb + rng.uniform(-2, 2), True,
+                                      size_h=eh))
+                    yid.append(id36_of(ch))
+                    ycase.append(case_of(ch))
+            xn = np.stack(xs_l)
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np_sized(xn[k], rng)
+                if rng.random() < 0.8:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.5:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice((0.8, 1.25))
+                if rng.random() < 0.3:      # AA/clutter bleed: 1px morph
+                    k3 = np.ones((3, 3), np.uint8)
+                    op = cv2.erode if rng.random() < 0.5 else cv2.dilate
+                    xn[k, 1] = op(xn[k, 1], k3, iterations=1)
+            x = torch.from_numpy(xn)
+            x[:, :2] += 0.02 * torch.rand(len(xn), 2, P, WID) - 0.01
+            yt = torch.tensor(yid, dtype=torch.long)
+            yc = torch.tensor(ycase, dtype=torch.long)
+            li, lc = model(x)
+            loss = crit(li, yt) + 3.0 * crit(lc, yc)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yt)
+            seen += len(yt)
+        sched.step()
+        acc = _quick_acc_sized(model, 3000, seed=999)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            sd["size_ch"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+        if last_path:
+            sdl = dict(model.state_dict())
+            sdl["ch1_whole"] = torch.tensor(1)
+            sdl["size_ch"] = torch.tensor(1)
+            torch.save(sdl, last_path)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom, comps = solver.analyze(solver.norm_scale(img))
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                if eh is None:
+                    continue
+                Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
+                                eb + jr.uniform(-2, 2), True, size_h=eh))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+def train_v13(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
+              path: str = "glyphnet13.pt", init: str = "glyphnet12.pt",
+              lr: float = 2e-4, last_path: str = "") -> None:
+    """v13 = v12 recipe, HARD-DOMINANT mix (60/30/10) and case loss x4:: 50% hard / 30% real / 20% easy cards,
+    case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
+    Suite v10: easy 90 hard 42 real 49; held-out hard per-char 88% vs suite
+    81% -> the remaining hard loss is selection/seg + case under clutter."""
+    import os
+    import solver
+    model = GlyphNet(multitask=True, wide=True, size_ch=True)
+    for cand in (init, "glyphnet8.pt", "glyphnet7.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            sd.pop("ch1_whole", None)
+            own = model.state_dict()
+            k0 = "trunk.0.weight"
+            if (k0 in sd and k0 in own and sd[k0].shape[1] == 2
+                    and own[k0].shape[1] == 3):
+                w = torch.zeros(own[k0].shape)
+                w[:, :2] = sd[k0]
+                sd[k0] = w
+                print("conv1 padded 2ch -> 3ch (size channel zero-init)",
+                      flush=True)
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), lr)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 999001
+    rng = np.random.default_rng(11)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            random.seed(seed)
+            xs_l, yid, ycase = [], [], []
+            while len(xs_l) < batch:
+                style = ("hard", "hard", "real", "hard", "easy",
+                         "hard", "real", "hard", "hard", "real")[len(xs_l) % 10]
+                img, truth, boxes = generate(style=style, boxes=True)
+                dom, comps = solver.analyze(solver.norm_scale(img))
+                for ch, (xc, base, _sz) in zip(truth, boxes):
+                    if len(xs_l) >= batch:
+                        break
+                    ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                    if abs(ex - xc) > 6 or eh is None:
+                        continue               # merged/split: skip label noise
+                    xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                                      eb + rng.uniform(-2, 2), True,
+                                      size_h=eh))
+                    yid.append(id36_of(ch))
+                    ycase.append(case_of(ch))
+            xn = np.stack(xs_l)
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np_sized(xn[k], rng)
+                if rng.random() < 0.8:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.5:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice((0.8, 1.25))
+                if rng.random() < 0.3:      # AA/clutter bleed: 1px morph
+                    k3 = np.ones((3, 3), np.uint8)
+                    op = cv2.erode if rng.random() < 0.5 else cv2.dilate
+                    xn[k, 1] = op(xn[k, 1], k3, iterations=1)
+            x = torch.from_numpy(xn)
+            x[:, :2] += 0.02 * torch.rand(len(xn), 2, P, WID) - 0.01
+            yt = torch.tensor(yid, dtype=torch.long)
+            yc = torch.tensor(ycase, dtype=torch.long)
+            li, lc = model(x)
+            loss = crit(li, yt) + 4.0 * crit(lc, yc)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yt)
+            seen += len(yt)
+        sched.step()
+        acc = _quick_acc_sized(model, 3000, seed=999)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            sd["size_ch"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+        if last_path:
+            sdl = dict(model.state_dict())
+            sdl["ch1_whole"] = torch.tensor(1)
+            sdl["size_ch"] = torch.tensor(1)
+            torch.save(sdl, last_path)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom, comps = solver.analyze(solver.norm_scale(img))
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                if eh is None:
+                    continue
+                Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
+                                eb + jr.uniform(-2, 2), True, size_h=eh))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+
+
+def train_v14(epochs: int = 40, patches_per_epoch: int = 24000, batch: int = 128,
+              path: str = "glyphnet14.pt", init: str = "glyphnet13.pt",
+              lr: float = 2e-4, last_path: str = "") -> None:
+    """v14 = v13 recipe, BALANCED mix (hard 50 / real 35 / easy 15): v13
+    bought +2 hard but cost ~5 real; this walks the mix back to the middle.: 50% hard / 30% real / 20% easy cards,
+    case loss x3, harsher patch aug (mask erode/dilate = AA & clutter bleed).
+    Suite v10: easy 90 hard 42 real 49; held-out hard per-char 88% vs suite
+    81% -> the remaining hard loss is selection/seg + case under clutter."""
+    import os
+    import solver
+    model = GlyphNet(multitask=True, wide=True, size_ch=True)
+    for cand in (init, "glyphnet8.pt", "glyphnet7.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            sd.pop("ch1_whole", None)
+            own = model.state_dict()
+            k0 = "trunk.0.weight"
+            if (k0 in sd and k0 in own and sd[k0].shape[1] == 2
+                    and own[k0].shape[1] == 3):
+                w = torch.zeros(own[k0].shape)
+                w[:, :2] = sd[k0]
+                sd[k0] = w
+                print("conv1 padded 2ch -> 3ch (size channel zero-init)",
+                      flush=True)
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), lr)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 111002
+    rng = np.random.default_rng(11)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            random.seed(seed)
+            xs_l, yid, ycase = [], [], []
+            while len(xs_l) < batch:
+                style = ("hard", "real", "hard", "real", "hard",
+                         "real", "hard", "easy", "hard", "real")[len(xs_l) % 10]
+                img, truth, boxes = generate(style=style, boxes=True)
+                dom, comps = solver.analyze(solver.norm_scale(img))
+                for ch, (xc, base, _sz) in zip(truth, boxes):
+                    if len(xs_l) >= batch:
+                        break
+                    ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                    if abs(ex - xc) > 6 or eh is None:
+                        continue               # merged/split: skip label noise
+                    xs_l.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                                      eb + rng.uniform(-2, 2), True,
+                                      size_h=eh))
+                    yid.append(id36_of(ch))
+                    ycase.append(case_of(ch))
+            xn = np.stack(xs_l)
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np_sized(xn[k], rng)
+                if rng.random() < 0.8:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.5:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice((0.8, 1.25))
+                if rng.random() < 0.3:      # AA/clutter bleed: 1px morph
+                    k3 = np.ones((3, 3), np.uint8)
+                    op = cv2.erode if rng.random() < 0.5 else cv2.dilate
+                    xn[k, 1] = op(xn[k, 1], k3, iterations=1)
+            x = torch.from_numpy(xn)
+            x[:, :2] += 0.02 * torch.rand(len(xn), 2, P, WID) - 0.01
+            yt = torch.tensor(yid, dtype=torch.long)
+            yc = torch.tensor(ycase, dtype=torch.long)
+            li, lc = model(x)
+            loss = crit(li, yt) + 4.0 * crit(lc, yc)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yt)
+            seen += len(yt)
+        sched.step()
+        acc = _quick_acc_sized(model, 3000, seed=999)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            sd["size_ch"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+        if last_path:
+            sdl = dict(model.state_dict())
+            sdl["ch1_whole"] = torch.tensor(1)
+            sdl["size_ch"] = torch.tensor(1)
+            torch.save(sdl, last_path)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom, comps = solver.analyze(solver.norm_scale(img))
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+                if eh is None:
+                    continue
+                Xv.append(patch(dom, ex + jr.uniform(-1.5, 1.5),
+                                eb + jr.uniform(-2, 2), True, size_h=eh))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+
+
+
+
+def _aug_patch_np_sized(p: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """_aug_patch_np on the two image channels; the size plane is a constant
+    and must survive geometric/photometric aug untouched."""
+    if p.shape[0] == 2:
+        return _aug_patch_np(p, rng)
+    out = _aug_patch_np(p[:2], rng)
+    return np.concatenate([out, p[2:]], axis=0)
+
+
+def _fresh_batch_sized(batch: int, seed: int):
+    """-> (x [B,3,P,WID], yid, ycase) anchored the way inference anchors."""
+    import solver
+    random.seed(seed)
+    rng = np.random.default_rng(seed)
+    xs, yid, ycase = [], [], []
+    while len(xs) < batch:
+        style = ("easy", "hard", "real")[len(xs) % 3]
+        img, truth, boxes = generate(style=style, boxes=True)
+        dom, comps = solver.analyze(solver.norm_scale(img))
+        for ch, (xc, base, _sz) in zip(truth, boxes):
+            if len(xs) >= batch:
+                break
+            ex, eb, eh = _est_anchor_h(dom, comps, xc, base)
+            if abs(ex - xc) > 6 or eh is None:
+                continue
+            xs.append(patch(dom, ex + rng.uniform(-1.5, 1.5),
+                            eb + rng.uniform(-2, 2), True, size_h=eh))
+            yid.append(id36_of(ch))
+            ycase.append(case_of(ch))
+    return (torch.from_numpy(np.stack(xs)).float(),
+            torch.tensor(yid, dtype=torch.long),
+            torch.tensor(ycase, dtype=torch.long))
+
+
+def _quick_acc_sized(model, m, seed=7):
+    model.eval()
+    c = 0
+    done = 0
+    with torch.no_grad():
+        while done < m:
+            x, yid, ycase = _fresh_batch_sized(min(500, m - done), seed)
+            seed += 1
+            li, lc = model(x)
+            pred = [char_of(a, b) for a, b in
+                    zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+            true = [char_of(a, b) for a, b in
+                    zip(yid.tolist(), ycase.tolist())]
+            c += sum(p == t for p, t in zip(pred, true))
+            done += len(x)
+    return c / m
+
+
+def _aug_patch_np(p: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """rich per-patch augmentation on the numpy patch (both channels)."""
+    if rng.random() < 0.5:
+        ang = float(rng.uniform(-6, 6))
+        M = cv2.getRotationMatrix2D((WID / 2, P / 2), ang, 1.0)
+        p = np.stack([cv2.warpAffine(c, M, (WID, P), flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=0) for c in p])
+    if rng.random() < 0.2:
+        p = np.stack([cv2.GaussianBlur(c, (3, 3), 0) for c in p])
+    if rng.random() < 0.3:
+        f = float(rng.uniform(0.85, 1.15))
+        nw = max(8, int(WID * f))
+        out = np.zeros((2, P, WID), np.float32)
+        for ci in range(2):
+            r = cv2.resize(p[ci], (nw, P), interpolation=cv2.INTER_LINEAR)
+            if nw >= WID:
+                x0 = (nw - WID) // 2
+                out[ci] = r[:, x0:x0 + WID]
+            else:
+                x0 = (WID - nw) // 2
+                out[ci, :, x0:x0 + nw] = r
+        p = out
+    return p
+
+
+def train_v9(epochs: int = 50, patches_per_epoch: int = 24000, batch: int = 128,
+             path: str = "glyphnet9.pt", init: str = "glyphnet8.pt") -> None:
+    """v9: rich aug (rotation/blur/width-jitter per patch) + case loss x2,
+    wide trunk, from v8.  Mining showed case = 3.4% and l/i-family identity
+    errors dominating; the ch1 whole-mask fix + these augs target both."""
+    import os
+    model = GlyphNet(multitask=True, wide=True)
+    for cand in (init, "glyphnet7.pt", "glyphnet5.pt"):
+        if os.path.exists(cand):
+            sd = torch.load(cand, map_location="cpu", weights_only=True)
+            own = model.state_dict()
+            sd = {k: v for k, v in sd.items()
+                  if k in own and own[k].shape == v.shape}
+            model.load_state_dict(sd, strict=False)
+            print(f"init from {cand}: {len(sd)} keys carried", flush=True)
+            break
+    opt = torch.optim.Adam(model.parameters(), 5e-4)
+    crit = nn.CrossEntropyLoss()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs,
+                                                       eta_min=1e-5)
+    steps = max(1, patches_per_epoch // batch)
+    best = 0.0
+    seed = 555001
+    rng = np.random.default_rng(3)
+    for ep in range(epochs):
+        model.train()
+        tot = 0.0
+        seen = 0
+        t0 = time.time()
+        for _s in range(steps):
+            seed += 1
+            x, yid, ycase = _fresh_batch(batch, seed, whole=True)
+            xn = x.numpy()
+            for k in range(len(xn)):
+                xn[k] = _aug_patch_np(xn[k], rng)
+                if rng.random() < 0.7:
+                    dx, dy = int(rng.integers(-1, 2)), int(rng.integers(-1, 2))
+                    xn[k] = np.roll(xn[k], (dy, dx), (1, 2))
+                if rng.random() < 0.4:
+                    xn[k, 0] = np.clip(xn[k, 0], 0, 1) ** rng.choice(
+                        (0.8, 1.25))
+            x = torch.from_numpy(xn) + 0.02 * torch.rand(batch, 2, P, WID) - 0.01
+            li, lc = model(x)
+            loss = crit(li, yid) + 2.0 * crit(lc, ycase)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(yid)
+            seen += len(yid)
+        sched.step()
+        acc = _quick_acc(model, 4000, seed=999, whole=True)
+        print(f"epoch {ep+1}/{epochs} loss {tot/seen:.4f} char-acc {acc:.2%} "
+              f"lr {sched.get_last_lr()[0]:.2e} ({time.time()-t0:.0f}s)",
+              flush=True)
+        if acc > best:
+            best = acc
+            sd = dict(model.state_dict())
+            sd["ch1_whole"] = torch.tensor(1)
+            torch.save(sd, path)
+            print(f"  saved ({acc:.2%})", flush=True)
+    model.eval()
+    for style in ("easy", "hard", "real"):
+        Xv, Yv = [], []
+        jr = np.random.default_rng(123)
+        for _ in range(120):
+            img, truth, boxes = generate(style=style, boxes=True)
+            dom = contrast_field(img)
+            for ch, (xc, base, _sz) in zip(truth, boxes):
+                Xv.append(patch(dom, xc + jr.uniform(-4, 4),
+                                base + jr.uniform(-6, 6), True))
+                Yv.append(ch)
+        Xv = torch.from_numpy(np.stack(Xv)).float()
+        cv = 0
+        with torch.no_grad():
+            for i in range(0, Xv.shape[0], 500):
+                li, lc = model(Xv[i:i + 500])
+                pred = [char_of(a, b) for a, b in
+                        zip(li.argmax(-1).tolist(), lc.argmax(-1).tolist())]
+                cv += sum(p == t for p, t in zip(pred, Yv[i:i + 500]))
+        print(f"held-out {style}: {cv / Xv.shape[0]:.2%}", flush=True)
+
+
+def _fresh_batch(batch: int, seed: int, whole: bool = False):
     """-> (x float32 [B,2,P,WID], yid, ycase) generated live, mixed styles."""
     random.seed(seed)
     xs, yid, ycase = [], [], []
@@ -849,7 +1700,7 @@ def _fresh_batch(batch: int, seed: int):
             if len(xs) >= batch:
                 break
             xs.append(patch(dom, xc + rng.uniform(-4, 4),
-                            base + rng.uniform(-6, 6)))
+                            base + rng.uniform(-6, 6), whole))
             yid.append(id36_of(ch))
             ycase.append(case_of(ch))
     return (torch.from_numpy(np.stack(xs)).float(),
@@ -857,13 +1708,13 @@ def _fresh_batch(batch: int, seed: int):
             torch.tensor(ycase, dtype=torch.long))
 
 
-def _quick_acc(model, m, seed=7):
+def _quick_acc(model, m, seed=7, whole=False):
     model.eval()
     c = 0
     done = 0
     with torch.no_grad():
         while done < m:
-            x, yid, ycase = _fresh_batch(min(500, m - done), seed)
+            x, yid, ycase = _fresh_batch(min(500, m - done), seed, whole)
             seed += 1
             li, lc = model(x)
             pred = [char_of(a, b) for a, b in
@@ -878,6 +1729,41 @@ def _quick_acc(model, m, seed=7):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "train5":
         train_v5(int(sys.argv[2]) if len(sys.argv) > 2 else 12,
+                 int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train14":
+        train_v14(int(sys.argv[2]) if len(sys.argv) > 2 else 30,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  last_path="glyphnet14_last.pt")
+    if len(sys.argv) > 1 and sys.argv[1] == "train13":
+        train_v13(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  last_path="glyphnet13_last.pt")
+    if len(sys.argv) > 1 and sys.argv[1] == "train12b":
+        # low-lr continuation; quick-acc best stays at glyphnet12.pt,
+        # every epoch end also lands in glyphnet12b_last.pt
+        train_v12(int(sys.argv[2]) if len(sys.argv) > 2 else 10,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  path="glyphnet12.pt", init="glyphnet12.pt",
+                  lr=4e-5, last_path="glyphnet12b_last.pt")
+    if len(sys.argv) > 1 and sys.argv[1] == "train12":
+        train_v12(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  last_path="glyphnet12_last.pt")
+    if len(sys.argv) > 1 and sys.argv[1] == "train11":
+        train_v11(int(sys.argv[2]) if len(sys.argv) > 2 else 40,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train11b":
+        # low-lr continuation of the saved v11 best; keeps quick-acc best at
+        # glyphnet11.pt and writes EVERY epoch end to glyphnet11b_last.pt
+        train_v11(int(sys.argv[2]) if len(sys.argv) > 2 else 8,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000,
+                  path="glyphnet11.pt", init="glyphnet11.pt",
+                  lr=4e-5, last_path="glyphnet11b_last.pt")
+    if len(sys.argv) > 1 and sys.argv[1] == "train10":
+        train_v10(int(sys.argv[2]) if len(sys.argv) > 2 else 30,
+                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
+    if len(sys.argv) > 1 and sys.argv[1] == "train9":
+        train_v9(int(sys.argv[2]) if len(sys.argv) > 2 else 50,
                  int(sys.argv[3]) if len(sys.argv) > 3 else 24000)
     if len(sys.argv) > 1 and sys.argv[1] == "train8":
         train_v8(int(sys.argv[2]) if len(sys.argv) > 2 else 40,

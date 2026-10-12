@@ -23,8 +23,8 @@ FONTS += [
     "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
 ]
-SIZES = (22, 26, 30, 34)
-ROTS = (-6, -3, 0, 3, 6)
+SIZES = (26, 30, 34, 38, 42)
+ROTS = (-10, -5, 0, 5, 10)
 CHARSET = string.ascii_letters + string.digits
 
 
@@ -75,6 +75,20 @@ def bank():
                         rows.append(_soft(t))
                         labels.append(ch)
     return np.array(rows, dtype=np.float32), labels
+
+
+def score_candidates(glyph: np.ndarray, cands) -> list:
+    """correlation scores for a few candidate chars (verifier use)."""
+    B, labels = bank()
+    v = _soft(_square_norm((glyph * 255).astype(np.uint8)))
+    out = []
+    for ch in cands:
+        idx = [i for i, l in enumerate(labels) if l == ch]
+        if not idx:
+            out.append(-1.0)
+            continue
+        out.append(float(np.max(B[idx] @ v)))
+    return out
 
 
 def classify(glyph: np.ndarray) -> str:

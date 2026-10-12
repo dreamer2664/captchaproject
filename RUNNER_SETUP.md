@@ -90,10 +90,31 @@
 | oct10 pm | + dom sign-after-ring fix (REAL pages were polarity-dead!) | - | - | - | rising |
 | oct10 eve | v5 multitask (14 ep, 24k) | 12 | 5 | 7 | 2 |
 | oct10 night | v7 on-the-fly 30ep + geometry cues | 72 | 27 | 30 | 8 |
-| training | v8 wide fc384, 40 ep, from v7 | ? | ? | ? | ? |
+| training | v8 wide fc384, 40 ep, from v7 | 73 | 27 | 31 | - |
+| oct11 | v9 whole-ch1 + case loss x2, stopped ep7/50 | 75 | 33 | 35 | - |
+| oct11 | v10 inference-estimator anchors, 30 ep, from v9 | 89 | 47 | 44 | - |
+| oct11 | + POSTPASS off (model beat every hand rule) | 89 | 48 | 44 | - |
+| oct11 | + generator ambiguity fix, O0 mini-pass, W-split gate | 91 | 42 | 44 | - |
+| training | v11 hard-weighted (50% hard), case x3, morph aug | ? | ? | ? | ? |
 
-v7 held-out per-char: easy 95.6 / hard 86.7 / real 85.4.
-glyphnet.pt = v7 weights (v4 kept at glyphnet_v4_backup2.pt).
+v10 held-out per-char (patches anchored where inference anchors them):
+easy 98.75 / hard 88.34 / real 88.75.
+glyphnet.pt = v10 weights.  Older: glyphnet9.pt, glyphnet8.pt, glyphnet7.pt.
+
+Two changes mattered more than any training run:
+1. ANCHOR MATCH (v10): training patches used to be cut at the true glyph
+   centre; inference cuts at the nearest component ink centroid + estimated
+   baseline.  Closing that train/serve skew was worth ~+15 exact.
+2. DELETE THE HAND RULES (POSTPASS=False): the case/geometry/template post
+   passes were written for the weak v7 head.  Against v10 they only misfired
+   -- A/B on 60 seeds per style: raw beat full by +8 easy, +8 hard, +9 real.
+   The code stays behind POSTPASS in solver.py for pre-v10 checkpoints.
+Ensembling v10+v9 is now a wash (same exact, 2x latency) so it defaults off;
+GLYPHNET_ENS=1 turns it back on.
+
+Suite numbers are means over 3 x 100 seeds (offsets 0 / 100003 / 200007):
+easy 90.0, hard 42.0, real 49.3 -- the single 100-seed run above is one draw
+of that, so treat +-4 on hard as noise, not progress.
 
 Bugs fixed oct10 (all silently catastrophic before):
 1. ImageDraw on RGBA writes alpha raw -> designs/noise rendered SOLID (looked
