@@ -437,6 +437,72 @@ def _aspect_table():
     return tab
 
 
+_STROKE_TAB = None
+
+
+def _stroke_table():
+    """per-font h/stroke ratios for upper vs lower of ambiguous chars.
+    h and stroke both scale with font size, so the ratio is SCALE-FREE:
+    it separates case even when every glyph on the card has a random size."""
+    global _STROKE_TAB
+    if _STROKE_TAB is not None:
+        return _STROKE_TAB
+    from PIL import Image as _Im, ImageDraw as _Id
+    tab = {}
+    for f in _GEN_FONTS:
+        for ch in "acemnorsuvwxz":
+            ru, rl = [], []
+            for size in (26, 34, 44):          # stroke bias is size-dependent:
+                for case, acc in ((ch.upper(), ru), (ch, rl)):   # sample it
+                    g = _Im.new("L", (110, 110), 255)
+                    _Id.Draw(g).text((55, 55), case, font=_gen_font(f, size),
+                                     fill=0, anchor="mm")
+                    a = (np.array(g) < 128).astype(np.uint8)
+                    ys, xs = np.where(a)
+                    if len(xs) == 0:
+                        continue
+                    h = ys.max() - ys.min() + 1
+                    mm = a[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+                    st = 2 * float(cv2.distanceTransform(mm, cv2.DIST_L2,
+                                                         3).max())
+                    if st > 0:
+                        acc.append(h / st)
+            if ru and rl and min(ru) - max(rl) >= 0.35:
+                tab.setdefault(ch, []).append((ru, rl))
+    _STROKE_TAB = tab
+    return tab
+
+
+def _stroke_case_vote(c: dict, ch: str) -> str | None:
+    tab = _stroke_table()
+    low = ch.lower()
+    if low not in tab or c["h"] < 12:
+        return None
+    # purity: bleed/fragment rows are narrow - trim before measuring h
+    rows = c["m"].sum(axis=1)
+    wide = np.where(rows >= 0.30 * rows.max())[0]
+    if len(wide) < 4:
+        return None
+    m2 = c["m"][wide.min():wide.max() + 1]
+    st = 2 * float(cv2.distanceTransform(m2, cv2.DIST_L2, 3).max())
+    if st <= 0:
+        return None
+    o = m2.shape[0] / st
+    up_v = lo_v = 0
+    min_margin = 9.9
+    for ru, rl in tab[low]:
+        du, dl = min(abs(o - r) for r in ru), min(abs(o - r) for r in rl)
+        if du < dl:
+            up_v += 1
+        else:
+            lo_v += 1
+        min_margin = min(min_margin, abs(du - dl))
+    n = up_v + lo_v
+    if min_margin < 0.35 or max(up_v, lo_v) < n - 1:
+        return None
+    return ch.upper() if up_v > lo_v else ch.lower()
+
+
 def _aspect_case_vote(c: dict, ch: str) -> str | None:
     """unanimous-font vote on the case of an ambiguous glyph, else None."""
     tab = _aspect_table()
