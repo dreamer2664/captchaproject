@@ -195,11 +195,13 @@ def generate(length: int | None = None, boxes: bool = False,
         card = Image.alpha_composite(card, des)   # real blending (ImageDraw
     layer = Image.new("RGBA", (W, HEIGHT), (0, 0, 0, 0))   # writes alpha raw)
 
-    # per-character: font, size, color, rotation  (the hard-captcha axes)
+    # per-character: font, color, rotation; ONE size per card (size changes
+    # BETWEEN rounds, like the real page - per-char size makes case unknowable)
     adv_total = 0
+    card_size = random.randint(26, 44)
     specs = []
     for _ in range(n):
-        size = random.randint(26, 44)
+        size = card_size
         _f = random.choice(FONT_FILES)
         specs.append(dict(
             ch=_pick_char(_f),
