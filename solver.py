@@ -337,6 +337,11 @@ def upright(m: np.ndarray) -> np.ndarray:
     return best
 
 
+try:
+    from generator import FONT_FILES as _GEN_FONTS, _font as _gen_font
+except Exception:
+    _GEN_FONTS, _gen_font = [], None
+
 TOP_CAP = set(string.ascii_uppercase + string.digits + "bdfhklt")
 BOT_DESC = set("gjpqy")
 
@@ -401,6 +406,54 @@ def _baseline(comps) -> float:
             bots = bots[: gi + 1]                     # keep main cluster side
     k = max(1, len(bots) // 2)
     return float(bots[-k:].mean())
+
+
+_ASPECT_TAB = None
+
+
+def _aspect_table():
+    """per-font (upper, lower) w/h aspects for case-ambiguous x-height chars,
+    measured on de-rotated ink: scale- AND rotation-invariant case cue."""
+    global _ASPECT_TAB
+    if _ASPECT_TAB is not None:
+        return _ASPECT_TAB
+    from PIL import Image as _Im, ImageDraw as _Id
+    tab = {}
+    for ch in "emnrsuvwx":
+        ups, los = [], []
+        for f in _GEN_FONTS:
+            fnt = _gen_font(f, 34)
+            for case, acc in ((ch.upper(), ups), (ch, los)):
+                g = _Im.new("L", (80, 80), 255)
+                _Id.Draw(g).text((40, 40), case, font=fnt, fill=0, anchor="mm")
+                a = np.array(g)
+                ys, xs = np.where(a < 128)
+                if len(xs) == 0:
+                    continue
+                acc.append((xs.max() - xs.min() + 1) / (ys.max() - ys.min() + 1))
+        if ups and los and abs(np.mean(ups) - np.mean(los)) >= 0.12:
+            tab[ch] = (np.array(ups), np.array(los))
+    _ASPECT_TAB = tab
+    return tab
+
+
+def _aspect_case_vote(c: dict, ch: str) -> str | None:
+    """unanimous-font vote on the case of an ambiguous glyph, else None."""
+    tab = _aspect_table()
+    low = ch.lower()
+    if low not in tab or c["h"] < 12:
+        return None
+    ups, los = tab[low]
+    u = upright(c["m"])
+    ys, xs = np.where(u)
+    if len(xs) < 8:
+        return None
+    o = (xs.max() - xs.min() + 1) / (ys.max() - ys.min() + 1)
+    du = float(np.min(np.abs(ups - o)))
+    dl = float(np.min(np.abs(los - o)))
+    if abs(du - dl) < 0.10:
+        return None
+    return ch.upper() if du < dl else ch.lower()
 
 
 def read_glyphnet_debug(img: Image.Image, expected_len: int | None = None):
